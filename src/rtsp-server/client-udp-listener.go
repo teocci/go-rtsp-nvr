@@ -1,0 +1,241 @@
+// Package rtsp_server
+// Created by RTT.
+// Author: teocci@yandex.com on 2022-Apr-12
+package rtsp_server
+
+import (
+	"crypto/rand"
+	"net"
+	"sync/atomic"
+	"time"
+
+	"github.com/pion/rtcp"
+
+	"golang.org/x/net/ipv4"
+)
+
+func randUint32() uint32 {
+	var b [4]byte
+	rand.Read(b[:])
+	return uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
+}
+
+func randIntN(n int) int {
+	return int(randUint32() & (uint32(n) - 1))
+}
+
+type clientUDPListener struct {
+	client          *Client
+	udpCxn          *net.UDPConn
+	remoteReadIP    net.IP
+	remoteReadPort  int
+	remoteWriteAddr *net.UDPAddr
+	trackID         int
+	isRTP           bool
+	running         bool
+	rtpPacketBuffer *rtpPacketMultiBuffer
+	lastPacketTime  *int64
+	processFunc     func(time.Time, []byte)
+
+	readerDone chan struct{}
+}
+
+func newClientUDPListenerPair(c *Client) (*clientUDPListener, *clientUDPListener) {
+	// choose two consecutive ports in range 65535-10000
+	// RTP port must be even and RTCP port odd
+	for {
+		rtpPort := (randIntN((65535-10000)/2) * 2) + 10000
+		address := mergeHostPortInt("", rtpPort)
+		rtpListener, err := newClientUDPListener(c, false, address)
+		if err != nil {
+			continue
+		}
+
+		rtcpPort := rtpPort + 1
+		address = mergeHostPortInt("", rtcpPort)
+		rtcpListener, err := newClientUDPListener(c, false, address)
+		if err != nil {
+			rtpListener.close()
+			continue
+		}
+
+		return rtpListener, rtcpListener
+	}
+}
+
+func newClientUDPListener(c *Client, multicast bool, address string) (client *clientUDPListener, err error) {
+	var udpCxn *net.UDPConn
+	var listenPacket net.PacketConn
+	var interfaces []net.Interface
+
+	if multicast {
+		var host, port string
+		host, port, err = net.SplitHostPort(address)
+		if err != nil {
+			return
+		}
+
+		address = mergeHostPort("224.0.0.0", port)
+		listenPacket, err = c.ListenPacket("udp", address)
+		if err != nil {
+			return
+		}
+
+		p := ipv4.NewPacketConn(listenPacket)
+
+		err = p.SetMulticastTTL(multicastTTL)
+		if err != nil {
+			return
+		}
+
+		interfaces, err = net.Interfaces()
+		if err != nil {
+			return
+		}
+
+		for _, i := range interfaces {
+			err = p.JoinGroup(&i, &net.UDPAddr{IP: net.ParseIP(host)})
+			if err != nil {
+				return
+			}
+		}
+
+		udpCxn = listenPacket.(*net.UDPConn)
+	} else {
+		listenPacket, err = c.ListenPacket("udp", address)
+		if err != nil {
+			return
+		}
+
+		udpCxn = listenPacket.(*net.UDPConn)
+	}
+
+	err = udpCxn.SetReadBuffer(udpKernelReadBufferSize)
+	if err != nil {
+		return
+	}
+
+	client = &clientUDPListener{
+		client:          c,
+		udpCxn:          udpCxn,
+		rtpPacketBuffer: newRTPPacketMultiBuffer(uint64(c.ReadBufferCount)),
+		lastPacketTime: func() *int64 {
+			v := int64(0)
+			return &v
+		}(),
+	}
+
+	return
+}
+
+func (u *clientUDPListener) close() {
+	if u.running {
+		u.stop()
+	}
+	u.udpCxn.Close()
+}
+
+func (u *clientUDPListener) port() int {
+	return u.udpCxn.LocalAddr().(*net.UDPAddr).Port
+}
+
+func (u *clientUDPListener) start(forPlay bool) {
+	if forPlay {
+		if u.isRTP {
+			u.processFunc = u.processPlayRTP
+		} else {
+			u.processFunc = u.processPlayRTCP
+		}
+	} else {
+		u.processFunc = u.processRecordRTCP
+	}
+
+	u.running = true
+	u.udpCxn.SetReadDeadline(time.Time{})
+	u.readerDone = make(chan struct{})
+	go u.runReader()
+}
+
+func (u *clientUDPListener) stop() {
+	u.udpCxn.SetReadDeadline(time.Now())
+	<-u.readerDone
+}
+
+func (u *clientUDPListener) runReader() {
+	defer close(u.readerDone)
+
+	for {
+		buf := make([]byte, maxPacketSize)
+		n, addr, err := u.udpCxn.ReadFrom(buf)
+		if err != nil {
+			return
+		}
+
+		udpAddress := addr.(*net.UDPAddr)
+
+		if !u.remoteReadIP.Equal(udpAddress.IP) || (!u.client.AnyPortEnable && u.remoteReadPort != udpAddress.Port) {
+			continue
+		}
+
+		now := time.Now()
+		atomic.StoreInt64(u.lastPacketTime, now.Unix())
+
+		u.processFunc(now, buf[:n])
+	}
+}
+
+func (u *clientUDPListener) processPlayRTP(now time.Time, payload []byte) {
+	pkt := u.rtpPacketBuffer.next()
+	err := pkt.Unmarshal(payload)
+	if err != nil {
+		return
+	}
+
+	ctx := ClientOnPacketRTPCtx{
+		TrackID: u.trackID,
+		Packet:  pkt,
+	}
+
+	ct := u.client.tracks[u.trackID]
+	u.client.processPacketRTP(ct, &ctx)
+	ct.rtcpReceiver.ProcessPacketRTP(time.Now(), pkt, ctx.PTSEqualsDTS)
+	u.client.OnPacketRTP(&ctx)
+}
+
+func (u *clientUDPListener) processPlayRTCP(now time.Time, payload []byte) {
+	packets, err := rtcp.Unmarshal(payload)
+	if err != nil {
+		return
+	}
+
+	for _, pkt := range packets {
+		u.client.tracks[u.trackID].rtcpReceiver.ProcessPacketRTCP(now, pkt)
+		u.client.OnPacketRTCP(&ClientOnPacketRTCPCtx{
+			TrackID: u.trackID,
+			Packet:  pkt,
+		})
+	}
+}
+
+func (u *clientUDPListener) processRecordRTCP(now time.Time, payload []byte) {
+	packets, err := rtcp.Unmarshal(payload)
+	if err != nil {
+		return
+	}
+
+	for _, pkt := range packets {
+		u.client.OnPacketRTCP(&ClientOnPacketRTCPCtx{
+			TrackID: u.trackID,
+			Packet:  pkt,
+		})
+	}
+}
+
+func (u *clientUDPListener) write(payload []byte) error {
+	// no mutex is needed here since Write() has an internal lock.
+	// https://github.com/golang/go/issues/27203#issuecomment-534386117
+
+	u.udpCxn.SetWriteDeadline(time.Now().Add(u.client.WriteTimeout))
+	_, err := u.udpCxn.WriteTo(payload, u.remoteWriteAddr)
+	return err
+}

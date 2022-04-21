@@ -1,0 +1,19 @@
+/**
+ * Created by RTT.
+ * Author: teocci@yandex.com on 2022-Feb-17
+ */
+
+body {
+    background-color: black;
+}
+
+.player-container {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: center;
+}
+
+#player {
+    height: calc(100vh * 0.98);
+}
